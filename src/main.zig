@@ -1650,6 +1650,8 @@ const FwdCtx = struct {
     act_in: []f32,
 };
 
+const EnableLayers = enum { layers_full, no_head };
+
 fn embedJob(ctx: *anyopaque, lo: usize, hi: usize) void {
     const f: *FwdCtx = @ptrCast(@alignCast(ctx));
     for (lo..hi) |i| {
@@ -1748,7 +1750,7 @@ fn splitQkv(alloc: Allocator, q: []f32, k: []f32, v: []f32, qkv: []const f32, L:
     parallel(alloc, L, &job, splitJob);
 }
 
-fn forward(alloc: Allocator, f: *FwdCtx) void {
+fn forward(alloc: Allocator, f: *FwdCtx, layers: EnableLayers) void {
     const m = f.m;
     const s = f.s;
     const L = f.L;
@@ -1863,7 +1865,11 @@ fn forward(alloc: Allocator, f: *FwdCtx) void {
         }
     }
 
-    @memcpy(f.pooled, s.x[0..D]);
+    if (layers == .layers_full) {
+        @memcpy(f.pooled, s.x[0..D]);
+    } else {
+        @memcpy(f.pooled, s.x[(f.L - 1) * D ..][0..D]); // token terakhir (final SEP)
+    }
 
     // ---- option markers -> scorer
     const t_ser = if (g_prof) nowNs() else 0;
@@ -1949,10 +1955,14 @@ const Seq = struct {
     qtype: u32,
 };
 
-fn buildSequence(alloc: Allocator, tok: *const Tokenizer, state: []const u8, qtype_name: []const u8, ins: []const u8, opts: []const []const u8, max_len: usize, head_max_len: usize) !Seq {
-    const ins2 = try replaceMask(alloc, ins);
-    const head_text = try std.fmt.allocPrint(alloc, "{s} question: {s}", .{ qtype_name, ins2 });
-    const head_ids = try encodeAll(tok, alloc, head_text);
+fn buildSequence(alloc: Allocator, tok: *const Tokenizer, state: []const u8, qtype_name: []const u8, ins: []const u8, opts: []const []const u8, max_len: usize, head_max_len: usize, layers: EnableLayers) !Seq {
+    var head_ids: []u32 = undefined;
+
+    if (layers == .layers_full) {
+        const ins2 = try replaceMask(alloc, ins);
+        const head_text = try std.fmt.allocPrint(alloc, "{s} question: {s}", .{ qtype_name, ins2 });
+        head_ids = try encodeAll(tok, alloc, head_text);
+    }
 
     var opt_ids = AList([]u32).init(alloc);
     for (opts) |o| {
@@ -1968,23 +1978,29 @@ fn buildSequence(alloc: Allocator, tok: *const Tokenizer, state: []const u8, qty
 
     var total: usize = 0;
     for (opt_ids.items) |o| total += o.len;
-    var opt_budget: i64 = @as(i64, @intCast(head_max_len)) - @as(i64, @intCast(total));
-    if (opt_budget < 16) {
-        const per: usize = @max(4, (head_max_len - 16) / @max(1, opt_ids.items.len));
-        for (opt_ids.items) |*o| {
-            if (o.*.len > per) o.* = o.*[0..per];
+
+    if (layers == .layers_full) {
+        var opt_budget: i64 = @as(i64, @intCast(head_max_len)) - @as(i64, @intCast(total));
+        if (opt_budget < 16) {
+            const per: usize = @max(4, (head_max_len - 16) / @max(1, opt_ids.items.len));
+            for (opt_ids.items) |*o| {
+                if (o.*.len > per) o.* = o.*[0..per];
+            }
+            total = 0;
+            for (opt_ids.items) |o| total += o.len;
+            opt_budget = @as(i64, @intCast(head_max_len)) - @as(i64, @intCast(total));
         }
-        total = 0;
-        for (opt_ids.items) |o| total += o.len;
-        opt_budget = @as(i64, @intCast(head_max_len)) - @as(i64, @intCast(total));
+        const head_keep: usize = @max(8, @as(usize, @intCast(@max(opt_budget, 0))));
+        if (head_ids.len > head_keep) head_ids = head_ids[0..head_keep];
     }
-    const head_keep: usize = @max(8, @as(usize, @intCast(@max(opt_budget, 0))));
-    var head_ids2 = head_ids;
-    if (head_ids2.len > head_keep) head_ids2 = head_ids2[0..head_keep];
 
     var ids = AList(u32).init(alloc);
     try ids.append(CLS_ID);
-    try ids.appendSlice(head_ids2);
+
+    if (layers == .layers_full) {
+        try ids.appendSlice(head_ids);
+    }
+
     try ids.append(SEP_ID);
     var markers = AList(u32).init(alloc);
     for (opt_ids.items) |o| {
@@ -2185,7 +2201,7 @@ const ModelChooser = struct {
         var opts: [4][]const u8 = undefined;
         try g.optionTexts(a, &opts);
 
-        const sq = try buildSequence(a, self.tok, text, "choice", SNAKE_INS, &opts, self.cfg.max_len, self.cfg.head_max_len);
+        const sq = try buildSequence(a, self.tok, text, "choice", SNAKE_INS, &opts, self.cfg.max_len, self.cfg.head_max_len, .no_head);
         if (g_prof) profReset();
         const t0 = nowMs(io);
         var f = FwdCtx{
@@ -2201,7 +2217,7 @@ const ModelChooser = struct {
             .feat = self.s.feat,
             .act_in = self.s.act_in,
         };
-        forward(self.gpa, &f);
+        forward(self.gpa, &f, .no_head);
         self.ms = nowMs(io) - t0;
         if (g_prof) try profReport(status);
 
@@ -2766,7 +2782,7 @@ pub fn main(init: std.process.Init) !void {
     var Lmax: usize = 1;
     var Kmax: usize = 1;
     for (questions, 0..) |q, qi| {
-        seqs[qi] = try buildSequence(aa, &tok, state, q.type_name, q.ins, q.opts, cfg.max_len, cfg.head_max_len);
+        seqs[qi] = try buildSequence(aa, &tok, state, q.type_name, q.ins, q.opts, cfg.max_len, cfg.head_max_len, .no_head);
         seqs[qi].qtype = q.qtype;
         Lmax = @max(Lmax, seqs[qi].ids.len);
         Kmax = @max(Kmax, seqs[qi].markers.len);
@@ -2816,7 +2832,7 @@ pub fn main(init: std.process.Init) !void {
             .feat = s.feat,
             .act_in = s.act_in,
         };
-        forward(gpa, &f);
+        forward(gpa, &f, .no_head);
 
         const k = sq.markers.len;
         const temp = @max(1e-3, m.temperature[q.qtype]);
