@@ -134,9 +134,15 @@ extern "kernel32" fn QueryPerformanceCounter(lpLargeInteger: *i64) callconv(.win
 extern "kernel32" fn QueryPerformanceFrequency(lpFrequency: *i64) callconv(.winapi) i32;
 
 fn nowNs() i64 {
-    var c: i64 = undefined;
-    _ = QueryPerformanceCounter(&c);
-    return @divTrunc(c * std.time.ns_per_s, g_qpc_freq);
+    if (comptime builtin.os.tag == .windows) {
+        var c: i64 = undefined;
+        _ = QueryPerformanceCounter(&c);
+        return @divTrunc(c * std.time.ns_per_s, g_qpc_freq);
+    }
+
+    var ts: std.os.linux.timespec = undefined;
+    _ = std.os.linux.clock_gettime(.MONOTONIC, &ts);
+    return @as(i64, ts.sec) * std.time.ns_per_s + ts.nsec;
 }
 
 const STAGE_NAMES = [_][]const u8{
@@ -185,6 +191,34 @@ fn profReport(w: *std.Io.Writer) !void {
         try w.print("  {s:<9} {d:>8.1} ms {d:>6.1}% {d:>7} calls\n", .{ name, ms, pct, g_stage_calls[i] });
     }
     try w.flush();
+}
+
+fn genLow(gen: *std.atomic.Value(u64)) *const u32 {
+    comptime std.debug.assert(builtin.cpu.arch.endian() == .little);
+    return @ptrCast(&gen.raw);
+}
+
+fn wakeAll(gen: *std.atomic.Value(u64)) void {
+    switch (comptime builtin.os.tag) {
+        .windows => std.os.windows.ntdll.RtlWakeAddressAll(&gen.raw),
+        .linux => {
+            _ = std.os.linux.futex_3arg(genLow(gen), .{ .cmd = .WAKE, .private = true }, std.math.maxInt(i32));
+        },
+        else => {},
+    }
+}
+
+fn waitWhileEqual(gen: *std.atomic.Value(u64), seen: u64) void {
+    switch (comptime builtin.os.tag) {
+        .windows => {
+            var expected = seen;
+            _ = std.os.windows.ntdll.RtlWaitOnAddress(&gen.raw, &expected, @sizeOf(u64), null);
+        },
+        .linux => {
+            _ = std.os.linux.futex_4arg(genLow(gen), .{ .cmd = .WAIT, .private = true }, @truncate(seen), null);
+        },
+        else => std.Thread.yield() catch {},
+    }
 }
 
 const JobFn = *const fn (ctx: *anyopaque, lo: usize, hi: usize) void;
@@ -253,7 +287,7 @@ const Pool = struct {
     fn park(self: *Pool, seen: u64) void {
         _ = self.parked.fetchAdd(1, .monotonic);
         if (self.gen.load(.acquire) == seen and !self.stop.load(.acquire)) {
-            _ = std.os.windows.ntdll.RtlWaitOnAddress(&self.gen.raw, &seen, @sizeOf(u64), null);
+            waitWhileEqual(&self.gen, seen);
         }
         _ = self.parked.fetchSub(1, .monotonic);
     }
@@ -274,7 +308,7 @@ const Pool = struct {
         self.next.store(0, .monotonic);
         self.live.store(nw, .monotonic);
         _ = self.gen.fetchAdd(1, .release);
-        if (self.parked.load(.acquire) != 0) std.os.windows.ntdll.RtlWakeAddressAll(&self.gen.raw);
+        if (self.parked.load(.acquire) != 0) wakeAll(&self.gen);
         self.drain();
         var spins: u32 = 0;
         while (self.live.load(.acquire) != 0) {
@@ -298,7 +332,8 @@ const Pool = struct {
 
     fn stopAll(self: *Pool) void {
         self.stop.store(true, .release);
-        std.os.windows.ntdll.RtlWakeAddressAll(&self.gen.raw);
+        // std.os.windows.ntdll.RtlWakeAddressAll(&self.gen.raw);
+        wakeAll(&self.gen);
         for (self.threads.items) |t| t.join();
         self.threads.deinit();
         self.nworkers = 0;
@@ -2308,7 +2343,7 @@ const WebSession = struct {
                 const d = try self.base.moveFn(self.base.ctx, io, g, status);
                 // baselines are deterministic about the direction they pick
                 var p: [4]f32 = .{ 0, 0, 0, 0 };
-                p[@intFromEnum(d)] = 1;
+                p[@backingInt(d)] = 1;
                 self.last = .{ .dir = d, .probs = p, .conf = 1, .act = 1, .tokens = 0, .ms = 0 };
                 return d;
             },
