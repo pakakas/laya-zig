@@ -1822,53 +1822,53 @@ fn forward(alloc: Allocator, f: *FwdCtx, layers: EnableLayers) void {
     parallel(alloc, L, f, typeEmbJob);
     if (dumping) dumpStats("temb", s.x, L);
 
-    // ---- decision head: 2 pre-norm transformer layers, bidirectional
-    for (0..HEAD_LAYERS) |l| {
-        const hl = &m.head[l];
-        g_stage = ST_NORM;
-        normInto(alloc, s.x, s.xn, L, hl.norm1_w, hl.norm1_b);
-        g_stage = ST_MATMUL;
-        linear16(alloc, s.qkv, s.xn, hl.in_proj_w, hl.in_proj_b, L, 3 * D, D);
-        g_stage = ST_SPLIT;
-        splitQkv(alloc, s.q, s.k, s.v, s.qkv, L);
-        g_stage = ST_ATTN;
-        var aj = AttJob{
-            .q = s.q,
-            .k = s.k,
-            .v = s.v,
-            .out = s.ctx,
-            .att = s.att,
-            .L = L,
-            .stride = L,
-            .win = null,
-        };
-        parallel(alloc, L, &aj, attWorker);
-        g_stage = ST_MATMUL;
-        linear16(alloc, s.xn, s.ctx, hl.out_proj_w, hl.out_proj_b, L, D, D);
-        g_stage = ST_RES;
-        parallel(alloc, L, f, addResJob);
-
-        g_stage = ST_NORM;
-        normInto(alloc, s.x, s.xn, L, hl.norm2_w, hl.norm2_b);
-        g_stage = ST_MATMUL;
-        linear16(alloc, s.ff, s.xn, hl.lin1_w, hl.lin1_b, L, HEAD_FF, D);
-        g_stage = ST_GELU;
-        parallel(alloc, L, f, reluJob);
-        g_stage = ST_MATMUL;
-        linear16(alloc, s.xn, s.ff, hl.lin2_w, hl.lin2_b, L, D, HEAD_FF);
-        g_stage = ST_RES;
-        parallel(alloc, L, f, addResJob);
-        if (dumping) {
-            var tag: [8]u8 = undefined;
-            const t = std.fmt.bufPrint(&tag, "h{d}", .{l}) catch "h?";
-            dumpStats(t, s.x, L);
-        }
-    }
-
     if (layers == .layers_full) {
+        // ---- decision head: 2 pre-norm transformer layers, bidirectional
+        for (0..HEAD_LAYERS) |l| {
+            const hl = &m.head[l];
+            g_stage = ST_NORM;
+            normInto(alloc, s.x, s.xn, L, hl.norm1_w, hl.norm1_b);
+            g_stage = ST_MATMUL;
+            linear16(alloc, s.qkv, s.xn, hl.in_proj_w, hl.in_proj_b, L, 3 * D, D);
+            g_stage = ST_SPLIT;
+            splitQkv(alloc, s.q, s.k, s.v, s.qkv, L);
+            g_stage = ST_ATTN;
+            var aj = AttJob{
+              .q = s.q,
+              .k = s.k,
+              .v = s.v,
+              .out = s.ctx,
+              .att = s.att,
+              .L = L,
+              .stride = L,
+              .win = null,
+            };
+            parallel(alloc, L, &aj, attWorker);
+            g_stage = ST_MATMUL;
+            linear16(alloc, s.xn, s.ctx, hl.out_proj_w, hl.out_proj_b, L, D, D);
+            g_stage = ST_RES;
+            parallel(alloc, L, f, addResJob);
+
+            g_stage = ST_NORM;
+            normInto(alloc, s.x, s.xn, L, hl.norm2_w, hl.norm2_b);
+            g_stage = ST_MATMUL;
+            linear16(alloc, s.ff, s.xn, hl.lin1_w, hl.lin1_b, L, HEAD_FF, D);
+            g_stage = ST_GELU;
+            parallel(alloc, L, f, reluJob);
+            g_stage = ST_MATMUL;
+            linear16(alloc, s.xn, s.ff, hl.lin2_w, hl.lin2_b, L, D, HEAD_FF);
+            g_stage = ST_RES;
+            parallel(alloc, L, f, addResJob);
+            if (dumping) {
+              var tag: [8]u8 = undefined;
+              const t = std.fmt.bufPrint(&tag, "h{d}", .{l}) catch "h?";
+              dumpStats(t, s.x, L);
+            }
+        }
+
         @memcpy(f.pooled, s.x[0..D]);
     } else {
-        @memcpy(f.pooled, s.x[(f.L - 1) * D ..][0..D]); // token terakhir (final SEP)
+        @memcpy(f.pooled, s.x[(f.L - 1) * D ..][0..D]);
     }
 
     // ---- option markers -> scorer
