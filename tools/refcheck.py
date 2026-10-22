@@ -8,7 +8,7 @@ would otherwise only show up as "the model behaves oddly": wrong GLU split,
 wrong RoPE pairing, wrong head layout, a missing norm.
 
     zig-out/bin/laya.exe --dumpstats --json q.json 2> _dump.txt
-    python -X utf8 tools/refcheck.py _dump.txt
+    python -X utf8 tools/refcheck.py _dump.txt --dir /path/to/multilingual
 
 Runs the full 22 encoder layers, both decision-head layers, the option-marker
 scorer and the final logits. Takes a couple of minutes: it is ~10M dot products
@@ -19,6 +19,8 @@ import math
 import re
 import struct
 import sys
+import argparse
+import os
 from operator import mul
 
 D = 768
@@ -260,17 +262,24 @@ def parse_dump(path):
 
 
 def main():
-    if len(sys.argv) < 2:
-        print(__doc__)
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("dump", help="dump file --dumpstats (stderr redirect)")
+    parser.add_argument("--dir", required=True, metavar="DIR", help="model.safetensors location")
+    args = parser.parse_args()
+
+    model_path = os.path.join(args.dir, "model.safetensors")
+    if not os.path.isfile(model_path):
+        print("error: model.safetensors not found in %s" % args.dir)
         return 1
-    meta, ids, marks, logits, got = parse_dump(sys.argv[1])
+
+    meta, ids, marks, logits, got = parse_dump(args.dump)
     if meta is None:
-        print("no [dump] output found in " + sys.argv[1])
+        print("no [dump] output found in " + args.dump)
         return 1
     L, qtype = meta
     print("reference check: L=%d qtype=%d markers=%s" % (L, qtype, marks))
 
-    st = Safetensors("model.safetensors")
+    st = Safetensors(model_path)
     x = [list(r) for r in st.rows("encoder.embeddings.tok_embeddings.weight", D, ids)]
     wnorm = st.get("encoder.embeddings.norm.weight")
     x = [layernorm(row, wnorm) for row in x]
